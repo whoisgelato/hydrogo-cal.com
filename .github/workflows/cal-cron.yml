@@ -1,0 +1,51 @@
+name: Cal.com Cron
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"    # every 5 minutes (UTC)
+    - cron: "*/15 * * * *"   # every 15 minutes (UTC)
+    - cron: "0 * * * *"      # hourly (UTC)
+  workflow_dispatch: {}       # lets you run it manually for testing
+
+jobs:
+  every_5_min:
+    if: github.event.schedule == '*/5 * * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      APP_URL: ${{ secrets.APP_URL }}
+    steps:
+      - name: webhookTriggers (*/5)
+        run: |
+          curl -sS -X POST "$APP_URL/api/cron/webhookTriggers" --fail-with-body
+
+  every_15_min:
+    if: github.event.schedule == '*/15 * * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      APP_URL: ${{ secrets.APP_URL }}
+    strategy:
+      matrix:
+        endpoint:
+          - "/api/cron/bookingReminder"
+          # Uncomment the ones you actually use:
+          # - "/api/cron/workflows/scheduleEmailReminders"
+          # - "/api/cron/workflows/scheduleSMSReminders"
+          # - "/api/cron/workflows/scheduleWhatsappReminders"
+    steps:
+      - name: Hit ${{ matrix.endpoint }} (*/15)
+        run: |
+          curl -sS -X POST "$APP_URL${{ matrix.endpoint }}" --fail-with-body
+
+  hourly:
+    if: github.event.schedule == '0 * * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      APP_URL: ${{ secrets.APP_URL }}
+    steps:
+      - name: changeTimeZone (hourly)
+        run: |
+          curl -sS -X POST "$APP_URL/api/cron/changeTimeZone" --fail-with-body
+      # If you use SMS pricing sync, keep this; otherwise you can remove it:
+      - name: checkSmsPrices (hourly, optional)
+        run: |
+          curl -sS -X POST "$APP_URL/api/cron/checkSmsPrices" --fail-with-body || true
