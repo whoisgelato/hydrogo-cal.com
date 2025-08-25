@@ -5,7 +5,7 @@ on:
     - cron: "*/5 * * * *"    # every 5 minutes (UTC)
     - cron: "*/15 * * * *"   # every 15 minutes (UTC)
     - cron: "0 * * * *"      # hourly (UTC)
-  workflow_dispatch: {}       # lets you run it manually for testing
+  workflow_dispatch: {}       # allow manual run for testing
 
 jobs:
   every_5_min:
@@ -13,16 +13,20 @@ jobs:
     runs-on: ubuntu-latest
     env:
       APP_URL: ${{ secrets.APP_URL }}
+      CRON_API_KEY: ${{ secrets.CRON_API_KEY }}
     steps:
       - name: webhookTriggers (*/5)
         run: |
-          curl -sS -X POST "$APP_URL/api/cron/webhookTriggers" --fail-with-body
+          curl -sS --retry 3 --retry-delay 2 --fail-with-body \
+            -X POST "$APP_URL/api/cron/webhookTriggers" \
+            -H "authorization: $CRON_API_KEY"
 
   every_15_min:
     if: github.event.schedule == '*/15 * * * *' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     env:
       APP_URL: ${{ secrets.APP_URL }}
+      CRON_API_KEY: ${{ secrets.CRON_API_KEY }}
     strategy:
       matrix:
         endpoint:
@@ -34,18 +38,25 @@ jobs:
     steps:
       - name: Hit ${{ matrix.endpoint }} (*/15)
         run: |
-          curl -sS -X POST "$APP_URL${{ matrix.endpoint }}" --fail-with-body
+          curl -sS --retry 3 --retry-delay 2 --fail-with-body \
+            -X POST "$APP_URL${{ matrix.endpoint }}" \
+            -H "authorization: $CRON_API_KEY"
 
   hourly:
     if: github.event.schedule == '0 * * * *' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     env:
       APP_URL: ${{ secrets.APP_URL }}
+      CRON_API_KEY: ${{ secrets.CRON_API_KEY }}
     steps:
       - name: changeTimeZone (hourly)
         run: |
-          curl -sS -X POST "$APP_URL/api/cron/changeTimeZone" --fail-with-body
-      # If you use SMS pricing sync, keep this; otherwise you can remove it:
+          curl -sS --retry 3 --retry-delay 2 --fail-with-body \
+            -X POST "$APP_URL/api/cron/changeTimeZone" \
+            -H "authorization: $CRON_API_KEY"
+      # Keep only if you use SMS pricing sync; otherwise remove:
       - name: checkSmsPrices (hourly, optional)
         run: |
-          curl -sS -X POST "$APP_URL/api/cron/checkSmsPrices" --fail-with-body || true
+          curl -sS --retry 3 --retry-delay 2 --fail-with-body \
+            -X POST "$APP_URL/api/cron/checkSmsPrices" \
+            -H "authorization: $CRON_API_KEY" || true
