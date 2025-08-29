@@ -198,6 +198,7 @@ const nextConfig = (phase) => {
       optimizePackageImports: ["@calcom/ui"],
       webpackMemoryOptimizations: true,
       webpackBuildWorker: true,
+      instrumentationHook: true
     },
     productionBrowserSourceMaps: true,
     /* We already do type check on GH actions */
