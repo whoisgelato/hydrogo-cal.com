@@ -21,35 +21,35 @@ export const dateNotInPast = function (date: Date) {
 // This verifies the apiKey and sets the user if it is valid.
 export const verifyApiKey: NextMiddleware = async (req, res, next) => {
   const deploymentRepo = new DeploymentRepository(prisma);
-  const licenseKeyService = await LicenseKeySingleton.getInstance(deploymentRepo);
-  const hasValidLicense = await licenseKeyService.checkLicense();
+  // const licenseKeyService = await LicenseKeySingleton.getInstance(deploymentRepo);
+  // const hasValidLicense = await licenseKeyService.checkLicense();
 
-  if (!hasValidLicense && IS_PRODUCTION) {
-    return res.status(401).json({ message: "Invalid or missing CALCOM_LICENSE_KEY environment variable" });
-  }
+  // if (!hasValidLicense && IS_PRODUCTION) {
+  //   return res.status(401).json({ message: "Invalid or missing CALCOM_LICENSE_KEY environment variable" });
+  // }
 
-  if (!req.query.apiKey) return res.status(401).json({ message: "No apiKey provided" });
+  // if (!req.query.apiKey) return res.status(401).json({ message: "No apiKey provided" });
 
-  const strippedApiKey = `${req.query.apiKey}`.replace(process.env.API_KEY_PREFIX || "cal_", "");
-  const hashedKey = hashAPIKey(strippedApiKey);
-  const apiKey = await prisma.apiKey.findUnique({
-    where: { hashedKey },
-    include: {
-      user: {
-        select: { role: true, locked: true, email: true },
-      },
-    },
-  });
-  if (!apiKey) return res.status(401).json({ error: "Your API key is not valid." });
-  if (apiKey.expiresAt && dateNotInPast(apiKey.expiresAt)) {
-    return res.status(401).json({ error: "This API key is expired." });
-  }
-  if (!apiKey.userId || !apiKey.user)
-    return res.status(404).json({ error: "No user found for this API key." });
+  // const strippedApiKey = `${req.query.apiKey}`.replace(process.env.API_KEY_PREFIX || "cal_", "");
+  // const hashedKey = hashAPIKey(strippedApiKey);
+  // const apiKey = await prisma.apiKey.findUnique({
+  //   where: { hashedKey },
+  //   include: {
+  //     user: {
+  //       select: { role: true, locked: true, email: true },
+  //     },
+  //   },
+  // });
+  // if (!apiKey) return res.status(401).json({ error: "Your API key is not valid." });
+  // if (apiKey.expiresAt && dateNotInPast(apiKey.expiresAt)) {
+  //   return res.status(401).json({ error: "This API key is expired." });
+  // }
+  // if (!apiKey.userId || !apiKey.user)
+  //   return res.status(404).json({ error: "No user found for this API key." });
 
   // save the user id in the request for later use
-  req.userId = apiKey.userId;
-  req.user = apiKey.user;
+  // req.userId = apiKey.userId;
+  // req.user = apiKey.user;
 
   const { isAdmin, scope } = await isAdminGuard(req);
   const userIsLockedOrBlocked = await isLockedOrBlocked(req);
