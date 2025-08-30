@@ -32,7 +32,7 @@ import {
   allowDisablingAttendeeConfirmationEmails,
   allowDisablingHostConfirmationEmails,
 } from "@calcom/features/ee/workflows/lib/allowDisablingStandardEmails";
-import { scheduleWorkflowReminders } from "@calcom/features/ee/workflows/lib/reminders/reminderScheduler";
+import { scheduleWorkflowReminders } from "@calcom/ee/workflows/lib/reminders/reminderScheduler";
 import { getFullName } from "@calcom/features/form-builder/utils";
 import { UsersRepository } from "@calcom/features/users/users.repository";
 import type { GetSubscriberOptions } from "@calcom/features/webhooks/lib/getWebhooks";
@@ -124,6 +124,19 @@ import handleSeats from "./handleSeats/handleSeats";
 
 const translator = short();
 const log = logger.getSubLogger({ prefix: ["[api] book:user"] });
+
+/** Fire-and-forget helper for background work (no await on request path) */
+const fireAndForget = (fn: () => Promise<void>) => {
+  try {
+    if (typeof setImmediate !== "undefined")
+      setImmediate(() => void fn().catch((e) => log.error("post-booking", e)));
+    else if (typeof queueMicrotask !== "undefined")
+      queueMicrotask(() => void fn().catch((e) => log.error("post-booking", e)));
+    else void fn().catch((e) => log.error("post-booking", e));
+  } catch (e) {
+    log.error("post-booking-schedule", e);
+  }
+};
 
 type IsFixedAwareUserWithCredentials = Omit<IsFixedAwareUser, "credentials"> & {
   credentials: CredentialForCalendarService[];
@@ -1948,6 +1961,303 @@ async function handler(
     // If it's not a reschedule, doesn't require confirmation and there's no price,
     // Create a booking
   } else if (isConfirmedByDefault) {
+    // ---- FAST-ACK PATH ----
+    if (!booking) {
+      throw new HttpError({ statusCode: 400, message: "Booking failed" });
+    }
+
+    // decide if payment is required; if so, keep original sync flow below
+    const bookingRequiresPaymentNow =
+      !Number.isNaN(paymentAppData.price) &&
+      paymentAppData.price > 0 &&
+      !originalRescheduledBooking?.paid &&
+      !!booking;
+
+    if (!bookingRequiresPaymentNow) {
+      // Lightweight payload back to caller immediately.
+      const immediateResponse = {
+        ...booking,
+        user: { ...booking.user, email: null },
+        paymentRequired: false,
+      };
+
+      fireAndForget(async () => {
+        try {
+          // Heavy work in background
+          const createManager = areCalendarEventsEnabled
+            ? await eventManager.create(evt)
+            : placeholderCreatedEvent;
+
+          if (evt.location) {
+            booking.location = evt.location;
+          }
+
+          evt.description = eventType.description;
+
+          const bgResults = createManager.results;
+          const bgReferencesToCreate = createManager.referencesToCreate;
+
+          const additionalInformation: AdditionalInformation = {};
+          let bgVideoCallUrl: string | undefined;
+
+          if (bgResults.length) {
+            // Google Meet handling (parity with upstream)
+            if (bookingLocation === MeetLocationType) {
+              const googleMeetResult = {
+                appName: GoogleMeetMetadata.name,
+                type: "conferencing" as const,
+                uid: bgResults[0].uid,
+                originalEvent: bgResults[0].originalEvent,
+              };
+
+              const googleCalIndex = bgReferencesToCreate.findIndex((ref) => ref.type === "google_calendar");
+              const googleCalResult = bgResults[googleCalIndex];
+
+              if (!googleCalResult) {
+                log.warn("Google Calendar not installed but using Google Meet as location");
+                bgResults.push({
+                  ...googleMeetResult,
+                  success: false,
+                  calWarnings: [tOrganizer("google_meet_warning")],
+                });
+              }
+
+              if (googleCalResult?.createdEvent?.hangoutLink) {
+                bgResults.push({
+                  ...googleMeetResult,
+                  success: true,
+                });
+
+                bgReferencesToCreate[googleCalIndex] = {
+                  ...bgReferencesToCreate[googleCalIndex],
+                  meetingUrl: googleCalResult.createdEvent.hangoutLink,
+                };
+
+                bgReferencesToCreate.push({
+                  type: "google_meet_video",
+                  meetingUrl: googleCalResult.createdEvent.hangoutLink,
+                  uid: googleCalResult.uid,
+                  credentialId: bgReferencesToCreate[googleCalIndex].credentialId,
+                });
+              } else if (googleCalResult && !googleCalResult.createdEvent?.hangoutLink) {
+                bgResults.push({
+                  ...googleMeetResult,
+                  success: false,
+                });
+              }
+            }
+
+            additionalInformation.hangoutLink = bgResults[0].createdEvent?.hangoutLink;
+            additionalInformation.conferenceData = bgResults[0].createdEvent?.conferenceData;
+            additionalInformation.entryPoints = bgResults[0].createdEvent?.entryPoints;
+
+            evt.appsStatus = handleAppsStatus(bgResults, booking, reqAppsStatus);
+            bgVideoCallUrl =
+              additionalInformation.hangoutLink ||
+              organizerOrFirstDynamicGroupMemberDefaultLocationUrl ||
+              bgVideoCallUrl;
+
+            if (!isDryRun && evt.iCalUID !== booking.iCalUID) {
+              await prisma.booking.update({
+                where: {
+                  id: booking.id,
+                },
+                data: {
+                  iCalUID: evt.iCalUID || booking.iCalUID,
+                },
+              });
+            }
+          }
+
+          // send emails
+          if (noEmail !== true && !(eventType.seatsPerTimeSlot && rescheduleUid)) {
+            await sendScheduledEmailsAndSMS(
+              {
+                ...evt,
+                additionalInformation,
+                additionalNotes,
+                customInputs,
+              },
+              eventNameObject,
+              eventType.metadata?.disableStandardEmails?.confirmation?.host
+                ? allowDisablingHostConfirmationEmails(workflows)
+                : false,
+              eventType.metadata?.disableStandardEmails?.confirmation?.attendee
+                ? allowDisablingAttendeeConfirmationEmails(workflows)
+                : false,
+              eventType.metadata
+            );
+          }
+
+          // Determine metadata for DB + webhooks
+          if (booking.location?.startsWith("http")) {
+            bgVideoCallUrl = booking.location;
+          }
+          const metadata =
+            bgVideoCallUrl != null
+              ? { videoCallUrl: getVideoCallUrlFromCalEvent(evt) || bgVideoCallUrl }
+              : undefined;
+
+          // Persist references & metadata
+          if (!isDryRun) {
+            await prisma.booking.update({
+              where: { uid: booking.uid },
+              data: {
+                location: evt.location,
+                metadata: { ...(typeof booking.metadata === "object" && booking.metadata), ...metadata },
+                references: {
+                  createMany: {
+                    data: bgReferencesToCreate,
+                  },
+                },
+              },
+            });
+          }
+
+          // schedule webhook triggers (meeting started/ended)
+          const subscribersMeetingEnded = await getWebhooks(subscriberOptionsMeetingEnded);
+          const subscribersMeetingStarted = await getWebhooks(subscriberOptionsMeetingStarted);
+
+          const scheduleTriggerPromises: Promise<unknown>[] = [];
+          if (booking && booking.status === BookingStatus.ACCEPTED) {
+            const bookingWithCalEventResponses = {
+              ...booking,
+              responses: reqBody.calEventResponses,
+            };
+            for (const subscriber of subscribersMeetingEnded) {
+              scheduleTriggerPromises.push(
+                scheduleTrigger({
+                  booking: bookingWithCalEventResponses,
+                  subscriberUrl: subscriber.subscriberUrl,
+                  subscriber,
+                  triggerEvent: WebhookTriggerEvents.MEETING_ENDED,
+                  isDryRun,
+                })
+              );
+            }
+
+            for (const subscriber of subscribersMeetingStarted) {
+              scheduleTriggerPromises.push(
+                scheduleTrigger({
+                  booking: bookingWithCalEventResponses,
+                  subscriberUrl: subscriber.subscriberUrl,
+                  subscriber,
+                  triggerEvent: WebhookTriggerEvents.MEETING_STARTED,
+                  isDryRun,
+                })
+              );
+            }
+          }
+
+          await Promise.all(scheduleTriggerPromises).catch((error) => {
+            loggerWithEventDetails.error(
+              "Error while scheduling webhook triggers (fast-ack path)",
+              JSON.stringify({ error })
+            );
+          });
+
+          // BOOKING_CREATED webhook
+          const webhookData: EventPayloadType = {
+            ...evt,
+            ...eventTypeInfo,
+            bookingId: booking?.id,
+            rescheduleId: undefined,
+            rescheduleUid: undefined,
+            rescheduleStartTime: undefined,
+            rescheduleEndTime: undefined,
+            metadata: { ...metadata, ...reqBody.metadata },
+            eventTypeId,
+            status: "ACCEPTED",
+            smsReminderNumber: booking?.smsReminderNumber || undefined,
+            rescheduledBy: reqBody.rescheduledBy,
+          };
+
+          await handleWebhookTrigger({
+            subscriberOptions,
+            eventTrigger,
+            webhookData,
+            isDryRun,
+          });
+
+          // reminders + no shows
+          const evtWithMetadata = {
+            ...evt,
+            rescheduleReason,
+            metadata,
+            eventType: { slug: eventType.slug, schedulingType: eventType.schedulingType, hosts: eventType.hosts },
+            bookerUrl,
+          };
+
+          if (!eventType.metadata?.disableStandardEmails?.all?.attendee) {
+            await scheduleMandatoryReminder({
+              evt: evtWithMetadata,
+              workflows,
+              requiresConfirmation: !isConfirmedByDefault,
+              hideBranding: !!eventType.owner?.hideBranding,
+              seatReferenceUid: evt.attendeeSeatId,
+              isPlatformNoEmail: noEmail && Boolean(platformClientId),
+              isDryRun,
+            });
+          }
+
+          await scheduleWorkflowReminders({
+            workflows,
+            smsReminderNumber: smsReminderNumber || null,
+            calendarEvent: evtWithMetadata,
+            isNotConfirmed: false,
+            isRescheduleEvent: false,
+            isFirstRecurringEvent: input.bookingData.allRecurringDates
+              ? input.bookingData.isFirstRecurringSlot
+              : undefined,
+            hideBranding: !!eventType.owner?.hideBranding,
+            seatReferenceUid: evt.attendeeSeatId,
+            isDryRun,
+          }).catch((error) =>
+            loggerWithEventDetails.error("Error while scheduling workflow reminders", JSON.stringify({ error }))
+          );
+
+          await scheduleNoShowTriggers({
+            booking: { startTime: booking.startTime, id: booking.id, location: booking.location },
+            triggerForUser,
+            organizerUser: { id: organizerUser.id },
+            eventTypeId,
+            teamId,
+            orgId,
+            isDryRun,
+          }).catch((error) =>
+            loggerWithEventDetails.error("Error while scheduling no show triggers", JSON.stringify({ error }))
+          );
+
+          if (!isDryRun) {
+            await handleAnalyticsEvents({
+              credentials: allCredentials,
+              rawBookingData,
+              bookingInfo: {
+                name: fullName,
+                email: bookerEmail,
+                eventName: "Cal.com lead",
+              },
+              isTeamEventType,
+            });
+          }
+        } catch (e) {
+          loggerWithEventDetails.error("Background work failed (fast-ack path)", safeStringify({ e }));
+        }
+      });
+
+      // Return immediately
+      return {
+        ...immediateResponse,
+        ...luckyUserResponse,
+        isDryRun,
+        ...(isDryRun ? { troubleshooterData } : {}),
+        references: [],
+        seatReferenceUid: evt.attendeeSeatId,
+        videoCallUrl: undefined,
+      };
+    }
+
+    // ---- ORIGINAL SYNC PATH (payment required) ----
     // Use EventManager to conditionally use all needed integrations.
     const createManager = areCalendarEventsEnabled ? await eventManager.create(evt) : placeholderCreatedEvent;
     if (evt.location) {
@@ -1986,9 +2296,7 @@ async function handler(
           };
 
           // Find index of google_calendar inside createManager.referencesToCreate
-          const googleCalIndex = createManager.referencesToCreate.findIndex(
-            (ref) => ref.type === "google_calendar"
-          );
+          const googleCalIndex = referencesToCreate.findIndex((ref) => ref.type === "google_calendar");
           const googleCalResult = results[googleCalIndex];
 
           if (!googleCalResult) {
@@ -2007,17 +2315,17 @@ async function handler(
             });
 
             // Add google_meet to referencesToCreate in the same index as google_calendar
-            createManager.referencesToCreate[googleCalIndex] = {
-              ...createManager.referencesToCreate[googleCalIndex],
+            referencesToCreate[googleCalIndex] = {
+              ...referencesToCreate[googleCalIndex],
               meetingUrl: googleCalResult.createdEvent.hangoutLink,
             };
 
             // Also create a new referenceToCreate with type video for google_meet
-            createManager.referencesToCreate.push({
+            referencesToCreate.push({
               type: "google_meet_video",
               meetingUrl: googleCalResult.createdEvent.hangoutLink,
               uid: googleCalResult.uid,
-              credentialId: createManager.referencesToCreate[googleCalIndex].credentialId,
+              credentialId: referencesToCreate[googleCalIndex].credentialId,
             });
           } else if (googleCalResult && !googleCalResult.createdEvent?.hangoutLink) {
             results.push({
