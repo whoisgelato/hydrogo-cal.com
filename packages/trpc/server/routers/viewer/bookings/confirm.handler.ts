@@ -6,7 +6,7 @@ import { sendDeclinedEmailsAndSMS } from "@calcom/emails";
 import { getAllCredentialsIncludeServiceAccountKey } from "@calcom/features/bookings/lib/getAllCredentialsForUsersOnEvent/getAllCredentials";
 import { getCalEventResponses } from "@calcom/features/bookings/lib/getCalEventResponses";
 import { handleConfirmation } from "@calcom/features/bookings/lib/handleConfirmation";
-import { handleWebhookTrigger } from "@calcom/features/bookings/lib/handleWebhookTrigger";
+import { handleWebhookTrigger } from "@calcom/features/webhooks/lib/handleWebhookTrigger";
 import { workflowSelect } from "@calcom/features/ee/workflows/lib/getAllWorkflows";
 import type { GetSubscriberOptions } from "@calcom/features/webhooks/lib/getWebhooks";
 import type { EventPayloadType, EventTypeInfo } from "@calcom/features/webhooks/lib/sendPayload";
@@ -207,7 +207,7 @@ export const confirmHandler = async ({ ctx, input }: ConfirmOptions) => {
     ...getCalEventResponses({
       bookingFields: booking.eventType?.bookingFields ?? null,
       booking,
-    }),
+    } as any),
     customInputs: isPrismaObjOrUndefined(booking.customInputs),
     startTime: booking.startTime.toISOString(),
     endTime: booking.endTime.toISOString(),
@@ -274,7 +274,7 @@ export const confirmHandler = async ({ ctx, input }: ConfirmOptions) => {
     // the recurring event (equal or less than recurring event configuration count)
     recurringEvent.count = groupedRecurringBookings[0]._count;
     // count changed, parsing again to get the new value in
-    evt.recurringEvent = parseRecurringEvent(recurringEvent);
+    (evt as any).recurringEvent = parseRecurringEvent(recurringEvent);
   }
 
   if (confirmed) {
@@ -291,19 +291,38 @@ export const confirmHandler = async ({ ctx, input }: ConfirmOptions) => {
       booking.location ?? "",
       (booking.eventType?.locations as LocationObject[]) || []
     );
-    evt.conferenceCredentialId = conferenceCredentialId.conferenceCredentialId;
-    await handleConfirmation({
-      user: { ...user, credentials: allCredentials },
-      evt,
-      recurringEventId,
-      prisma,
-      bookingId,
-      booking,
-      emailsEnabled,
-      platformClientParams,
-    });
+    (evt as any).conferenceCredentialId = conferenceCredentialId.conferenceCredentialId;
+
+    // 🔁 changed: ensure ACCEPTED is visible immediately, then run heavy work in background
+    if (booking.status !== BookingStatus.ACCEPTED) {
+      await prisma.booking.update({
+        where: { id: bookingId },
+        data: { status: BookingStatus.ACCEPTED },
+      });
+    }
+
+    const kickoff = async () => {
+      try {
+        await handleConfirmation({
+          user: { ...user, credentials: allCredentials },
+          evt,
+          recurringEventId,
+          prisma,
+          bookingId,
+          booking,
+          emailsEnabled,
+          platformClientParams,
+        });
+      } catch (e) {
+        // never block user response
+        console.error("[post-booking async] handleConfirmation failed", e);
+      }
+    };
+    if (typeof setImmediate !== "undefined") setImmediate(kickoff);
+    else if (typeof queueMicrotask !== "undefined") queueMicrotask(kickoff);
+    else void kickoff();
   } else {
-    evt.rejectionReason = rejectionReason;
+    (evt as any).rejectionReason = rejectionReason;
     if (recurringEventId) {
       // The booking to reject is a recurring event and comes from /booking/upcoming, proceeding to mark all related
       // bookings as rejected.
@@ -338,10 +357,7 @@ export const confirmHandler = async ({ ctx, input }: ConfirmOptions) => {
       });
     }
 
-    if (emailsEnabled) {
-      await sendDeclinedEmailsAndSMS(evt, booking.eventType?.metadata as EventTypeMetadata);
-    }
-
+    // 🔁 changed: send decline emails & webhooks in background
     const teamId = await getTeamIdFromEventType({
       eventType: {
         team: { id: booking.eventType?.teamId ?? null },
@@ -351,7 +367,6 @@ export const confirmHandler = async ({ ctx, input }: ConfirmOptions) => {
 
     const orgId = await getOrgIdFromMemberOrTeamId({ memberId: booking.userId, teamId });
 
-    // send BOOKING_REJECTED webhooks
     const subscriberOptions: GetSubscriberOptions = {
       userId: booking.userId,
       eventTypeId: booking.eventTypeId,
@@ -377,7 +392,20 @@ export const confirmHandler = async ({ ctx, input }: ConfirmOptions) => {
       status: BookingStatus.REJECTED,
       smsReminderNumber: booking.smsReminderNumber || undefined,
     };
-    await handleWebhookTrigger({ subscriberOptions, eventTrigger, webhookData });
+
+    const kickoffReject = async () => {
+      try {
+        if (emailsEnabled) {
+          await sendDeclinedEmailsAndSMS(evt, booking.eventType?.metadata as EventTypeMetadata);
+        }
+        await handleWebhookTrigger({ subscriberOptions, eventTrigger, webhookData });
+      } catch (e) {
+        console.error("[post-booking async] rejection notifications failed", e);
+      }
+    };
+    if (typeof setImmediate !== "undefined") setImmediate(kickoffReject);
+    else if (typeof queueMicrotask !== "undefined") queueMicrotask(kickoffReject);
+    else void kickoffReject();
   }
 
   const message = `Booking ${confirmed}` ? "confirmed" : "rejected";

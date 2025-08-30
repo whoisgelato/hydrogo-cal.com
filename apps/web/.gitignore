@@ -42,6 +42,7 @@ yarn-error.log*
 .env.production.local
 .env.*
 !.env.example
+/packages/primsa/.env
 
 # vercel
 .vercel
